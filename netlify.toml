@@ -1,3 +1,100 @@
-[[edge_functions]]
-path = "/*"
-function = "proxy"
+// Netlify Edge Function: Robust proxy for Printify storefront
+export default async (request, context) => {
+  const upstream = Deno.env.get("PRINTIFY_STORE_URL") || "";
+  if (!upstream) {
+    return new Response(
+      "PRINTIFY_STORE_URL is not set in Netlify → Site settings → Environment.",
+      { status: 500 }
+    );
+  }
+
+  const reqUrl = new URL(request.url);
+  const upstreamURL = new URL(upstream);
+
+  // Build the target URL using the path/query from our request
+  const targetURL = new URL(reqUrl.pathname + reqUrl.search, upstreamURL);
+
+  // Clone and adjust headers so upstream treats us as first-party
+  const headers = new Headers(request.headers);
+  headers.set("Host", upstreamURL.host);
+  headers.set("Origin", upstreamURL.origin);
+  headers.set("Referer", upstreamURL.origin + "/");
+  // Some proxies forward these; keep them sane
+  headers.set("X-Forwarded-Host", reqUrl.host);
+  headers.set("X-Forwarded-Proto", reqUrl.protocol.replace(":", ""));
+
+  // Forward body for non-GET/HEAD
+  let body;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    body = await request.arrayBuffer();
+  }
+
+  // Fetch from upstream without auto-follow so we can rewrite Location
+  const upstreamResp = await fetch(targetURL.toString(), {
+    method: request.method,
+    headers,
+    body,
+    redirect: "manual",
+  });
+
+  // Copy headers we care about
+  const newHeaders = new Headers(upstreamResp.headers);
+
+  // Rewrite redirects to stay on our origin
+  const loc = newHeaders.get("Location");
+  if (loc) {
+    try {
+      const locURL = new URL(loc, upstreamURL);
+      // If redirect points to upstream origin, rewrite to our origin
+      if (locURL.origin === upstreamURL.origin) {
+        const rewritten = new URL(
+          locURL.pathname + locURL.search + locURL.hash,
+          reqUrl.origin
+        ).toString();
+        newHeaders.set("Location", rewritten);
+      }
+    } catch (_) {}
+  }
+
+  // Helper: rewrite any absolute references to upstream into our origin
+  async function rewriteBody(resp, contentType) {
+    const text = await resp.text();
+    const upstreamOrigin = upstreamURL.origin;
+    const upstreamHost = upstreamURL.host;
+
+    // Replace:
+    // 1) exact origin (https://vaultfiber-xrp.printify.me)
+    // 2) protocol-specific host patterns
+    // 3) protocol-relative //host patterns
+    let rewritten = text
+      .replaceAll(upstreamOrigin, reqUrl.origin)
+      .replaceAll("https://" + upstreamHost, reqUrl.origin)
+      .replaceAll("http://" + upstreamHost, reqUrl.origin)
+      .replaceAll("//" + upstreamHost, reqUrl.origin);
+
+    // Also guard against JSON config or JS strings containing upstream
+    // (Keep it simple and broad; safe for HTML/JS/JSON)
+    return new Response(rewritten, {
+      status: resp.status,
+      headers: newHeaders,
+    });
+  }
+
+  const ct = (newHeaders.get("content-type") || "").toLowerCase();
+
+  // For HTML, JS, or JSON, rewrite occurrences of the upstream host/origin
+  if (
+    ct.includes("text/html") ||
+    ct.includes("application/javascript") ||
+    ct.includes("text/javascript") ||
+    ct.includes("application/json")
+  ) {
+    return await rewriteBody(upstreamResp, ct);
+  }
+
+  // Otherwise, stream bytes as-is (images, css, fonts, etc.)
+  return new Response(upstreamResp.body, {
+    status: upstreamResp.status,
+    headers: newHeaders,
+  });
+};
