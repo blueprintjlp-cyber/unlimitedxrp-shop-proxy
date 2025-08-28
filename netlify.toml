@@ -1,0 +1,9 @@
+[edge_functions]
+  bundler = "esbuild"
+
+[[edge_functions]]
+path = "/*"
+function = "proxy"
+
+[vars]
+PRINTIFY_STORE_URL = "https://vaultfiber-xrp.printify.me/"
