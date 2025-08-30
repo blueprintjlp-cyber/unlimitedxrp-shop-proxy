@@ -1,57 +1,43 @@
-// Minimal working proxy for your Printify storefront
-import { HTMLRewriter } from "https://ghuc.cc/worker-tools/html-rewriter/index.ts";
+// SUPER MINIMAL PROXY — no HTML rewriting, just passes through
+const getEnv = (k) =>
+  (globalThis?.Netlify?.env?.get?.(k)) ??
+  (typeof Deno !== "undefined" && Deno?.env?.get?.(k)) ??
+  undefined;
 
-export default async (request, context) => {
-  const { PRINTIFY_STORE_URL, USD_STORE_URL } = context.env;
+export default async (request) => {
+  try {
+    const BASE = getEnv("USD_STORE_URL") || getEnv("PRINTIFY_STORE_URL");
+    if (!BASE) return new Response("Missing PRINTIFY_STORE_URL or USD_STORE_URL", { status: 500 });
 
-  const reqUrl = new URL(request.url);
-  const path = reqUrl.pathname;
+    const url = new URL(request.url);
+    const upstream = new URL(url.pathname + url.search, BASE);
 
-  const base = USD_STORE_URL || PRINTIFY_STORE_URL;
-  if (!base) return new Response("Missing PRINTIFY_STORE_URL or USD_STORE_URL", { status: 500 });
+    // Forward request
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    headers.set("x-forwarded-host", url.host);
 
-  const upstreamUrl = new URL(path + reqUrl.search, base);
+    const res = await fetch(upstream.toString(), {
+      method: request.method,
+      headers,
+      body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
+      redirect: "manual",
+    });
 
-  const headers = new Headers(request.headers);
-  headers.delete("host");
-  headers.set("x-forwarded-host", reqUrl.host);
-
-  const res = await fetch(upstreamUrl.toString(), {
-    method: request.method,
-    headers,
-    body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-    redirect: "manual",
-  });
-
-  if (res.status >= 301 && res.status <= 308) {
-    const loc = res.headers.get("location");
-    if (loc) {
-      const rewritten = loc.replace(/https?:\/\/[^/]*printify[^/]*\.me/gi, reqUrl.origin);
-      return Response.redirect(rewritten, res.status);
-    }
-    return res;
-  }
-
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("text/html")) {
-    return new Response(res.body, { status: res.status, headers: res.headers });
-  }
-
-  const pass = new Headers(res.headers);
-  pass.set("content-type", "text/html; charset=utf-8");
-
-  const rewriter = new HTMLRewriter().on("a[href], link[href], script[src], img[src]", {
-    element(el) {
-      for (const attr of ["href", "src"]) {
-        const val = el.getAttribute(attr);
-        if (val && /https?:\/\/[^/]*printify[^/]*\.me/i.test(val)) {
-          el.setAttribute(attr, val.replace(/https?:\/\/[^/]*printify[^/]*\.me/gi, reqUrl.origin));
-        }
+    // Keep users on your domain if upstream redirects
+    if (res.status >= 301 && res.status <= 308) {
+      const loc = res.headers.get("location");
+      if (loc) {
+        const rewritten = loc.replace(/https?:\/\/[^/]*printify[^/]*\.me/gi, url.origin);
+        return Response.redirect(rewritten, res.status);
       }
-    },
-  });
+      return res;
+    }
 
-  return rewriter.transform(new Response(res.body, { status: res.status, headers: pass }));
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } catch (e) {
+    return new Response("Edge proxy error: " + (e && e.message ? e.message : String(e)), { status: 502 });
+  }
 };
 
 export const config = { path: "/*" };
