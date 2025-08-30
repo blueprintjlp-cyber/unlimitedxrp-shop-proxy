@@ -1,64 +1,57 @@
-// Netlify Edge Function: Proxy + simple rewrite for Printify storefront
-// Routes all traffic through your domain while fetching from PRINTIFY_STORE_URL.
+// Minimal working proxy for your Printify storefront
+import { HTMLRewriter } from "https://ghuc.cc/worker-tools/html-rewriter/index.ts";
+
 export default async (request, context) => {
-  const upstream = Deno.env.get("PRINTIFY_STORE_URL") || "";
+  const { PRINTIFY_STORE_URL, USD_STORE_URL } = context.env;
+
   const reqUrl = new URL(request.url);
+  const path = reqUrl.pathname;
 
-  if (!upstream) {
-    const msg = `PRINTIFY_STORE_URL is not set. Please set it in Netlify -> Site settings -> Environment.`;
-    return new Response(msg, { status: 500 });
-  }
+  const base = USD_STORE_URL || PRINTIFY_STORE_URL;
+  if (!base) return new Response("Missing PRINTIFY_STORE_URL or USD_STORE_URL", { status: 500 });
 
-  const upstreamURL = new URL(upstream);
-  const targetURL = new URL(reqUrl.pathname + reqUrl.search, upstreamURL);
+  const upstreamUrl = new URL(path + reqUrl.search, base);
 
-  // Clone request headers and adjust Host for upstream
   const headers = new Headers(request.headers);
-  headers.set("host", upstreamURL.host);
+  headers.delete("host");
+  headers.set("x-forwarded-host", reqUrl.host);
 
-  // Forward the request body when not GET/HEAD
-  let body;
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    body = await request.arrayBuffer();
-  }
-
-  const upstreamResp = await fetch(targetURL.toString(), {
+  const res = await fetch(upstreamUrl.toString(), {
     method: request.method,
     headers,
-    body,
+    body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
     redirect: "manual",
   });
 
-  // Copy headers and rewrite Location if it points back to upstream origin
-  const newHeaders = new Headers(upstreamResp.headers);
-  const location = newHeaders.get("location");
-  if (location) {
-    try {
-      const locURL = new URL(location, upstreamURL);
-      if (locURL.origin === upstreamURL.origin) {
-        // Replace with our current domain/origin
-        const myOrigin = reqUrl.origin;
-        const rewritten = new URL(locURL.pathname + locURL.search + locURL.hash, myOrigin).toString();
-        newHeaders.set("location", rewritten);
+  if (res.status >= 301 && res.status <= 308) {
+    const loc = res.headers.get("location");
+    if (loc) {
+      const rewritten = loc.replace(/https?:\/\/[^/]*printify[^/]*\.me/gi, reqUrl.origin);
+      return Response.redirect(rewritten, res.status);
+    }
+    return res;
+  }
+
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("text/html")) {
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  }
+
+  const pass = new Headers(res.headers);
+  pass.set("content-type", "text/html; charset=utf-8");
+
+  const rewriter = new HTMLRewriter().on("a[href], link[href], script[src], img[src]", {
+    element(el) {
+      for (const attr of ["href", "src"]) {
+        const val = el.getAttribute(attr);
+        if (val && /https?:\/\/[^/]*printify[^/]*\.me/i.test(val)) {
+          el.setAttribute(attr, val.replace(/https?:\/\/[^/]*printify[^/]*\.me/gi, reqUrl.origin));
+        }
       }
-    } catch (_e) {}
-  }
-
-  // For HTML responses, lightly rewrite absolute origins in the body content
-  const contentType = (newHeaders.get("content-type") || "").toLowerCase();
-  if (contentType.includes("text/html")) {
-    const html = await upstreamResp.text();
-    const upstreamOrigin = upstreamURL.origin;
-    const rewrittenHtml = html.replaceAll(upstreamOrigin, reqUrl.origin);
-    return new Response(rewrittenHtml, {
-      status: upstreamResp.status,
-      headers: newHeaders,
-    });
-  }
-
-  // Stream other content as-is
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    headers: newHeaders,
+    },
   });
+
+  return rewriter.transform(new Response(res.body, { status: res.status, headers: pass }));
 };
+
+export const config = { path: "/*" };
